@@ -75,6 +75,7 @@ pub struct JiraTimeApp {
     update_info: Option<UpdateInfo>,
     update_checking: bool,
     update_applying: bool,
+    restart_pending: bool,
 
     // Progress bar state
     progress: f32,           // Current progress 0.0-1.0
@@ -183,6 +184,7 @@ impl JiraTimeApp {
             update_info: None,
             update_checking: false,
             update_applying: false,
+            restart_pending: false,
             progress: 0.0,
             progress_start: std::time::Instant::now(),
             progress_phase: ProgressPhase::Idle,
@@ -453,10 +455,10 @@ impl JiraTimeApp {
                     }
                     #[cfg(not(target_os = "macos"))]
                     {
-                        // Restart the app by spawning new process and exiting
+                        // Spawn new process and request graceful shutdown
                         if let Ok(exe) = std::env::current_exe() {
                             let _ = std::process::Command::new(exe).spawn();
-                            std::process::exit(0);
+                            self.restart_pending = true;
                         }
                     }
                 }
@@ -1427,6 +1429,13 @@ impl eframe::App for JiraTimeApp {
 
         // Check for async results
         self.check_async_results();
+
+        // Handle graceful restart after update
+        if self.restart_pending {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
 
         // Update progress bar animation
         let elapsed = self.progress_start.elapsed().as_secs_f32();
