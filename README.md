@@ -37,8 +37,8 @@ Download the latest release for your platform from the [Releases](../../releases
 macOS may block the downloaded binary. To allow it to run:
 
 ```bash
-xattr -d com.apple.quarantine ~/Downloads/timebox-macos-arm64
-chmod +x ~/Downloads/timebox-macos-arm64
+xattr -d com.apple.quarantine ~/Downloads/timebox-aarch64-apple-darwin
+chmod +x ~/Downloads/timebox-aarch64-apple-darwin
 ```
 
 Adjust the path if you downloaded to a different location.

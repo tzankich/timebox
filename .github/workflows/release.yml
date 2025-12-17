@@ -17,22 +17,22 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: timebox.exe
-            asset_name: timebox-windows-x64.exe
+            asset_name: timebox-x86_64-pc-windows-msvc.exe
             upx: true
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: timebox
-            asset_name: timebox-macos-x64
+            asset_name: timebox-x86_64-apple-darwin
             upx: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: timebox
-            asset_name: timebox-macos-arm64
+            asset_name: timebox-aarch64-apple-darwin
             upx: false  # UPX doesn't support ARM64 macOS well
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: timebox
-            asset_name: timebox-linux-x64
+            asset_name: timebox-x86_64-unknown-linux-gnu
             upx: true
 
     runs-on: ${{ matrix.os }}

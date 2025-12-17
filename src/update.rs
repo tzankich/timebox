@@ -37,6 +37,7 @@ pub fn apply_update() -> Result<()> {
         .repo_name(GITHUB_REPO)
         .bin_name(get_bin_name())
         .target(get_target())
+        .no_confirm(true)
         .current_version(cargo_crate_version!())
         .build()?
         .update()?;
