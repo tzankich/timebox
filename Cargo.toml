@@ -1,0 +1,58 @@
+[package]
+name = "timebox"
+version = "1.2.4"
+edition = "2021"
+
+[dependencies]
+# GUI
+eframe = "0.29"
+egui = "0.29"
+egui-phosphor = { version = "0.7", features = ["fill"] }
+
+# Async HTTP
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
+
+# Encoding
+base64 = "0.22"
+urlencoding = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config storage
+directories = "5"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Open URLs in browser
+open = "5"
+
+# Auto-update from GitHub releases
+self_update = { version = "0.41", features = ["archive-zip"] }
+
+# Image processing (for app icon)
+image = "0.25"
+
+# Build dependencies (Windows icon embedding)
+[build-dependencies]
+winresource = "0.1"
+ico = "0.3"
+image = "0.25"
+
+# Faster dev builds
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = "z"    # Optimize for size
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
