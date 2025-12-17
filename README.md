@@ -2,6 +2,8 @@
 
 A native desktop application for quickly logging time to Jira issues. Built with Rust and egui for a fast, responsive experience.
 
+![Timebox](images/list-view.png)
+
 ## Supported platforms
 
 - Windows (x64)
