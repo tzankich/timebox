@@ -142,7 +142,7 @@ impl JiraTimeApp {
 
         let mut app = Self {
             show_settings: false,
-            settings_domain: config.jira_domain.clone(),
+            settings_domain: config.jira_domain.trim_end_matches(".atlassian.net").to_string(),
             settings_email: config.email.clone(),
             settings_token: String::new(),
             settings_font_scale: config.font_scale,
@@ -231,7 +231,11 @@ impl JiraTimeApp {
             return;
         }
         self.update_applying = true;
-        self.status_message = Some(("Downloading update...".to_string(), false));
+        self.status_message = None;
+        // Start progress animation
+        self.progress = 0.0;
+        self.progress_phase = ProgressPhase::FastStart;
+        self.progress_start = std::time::Instant::now();
 
         let tx = self.result_tx.clone();
         self.runtime.spawn(async move {
@@ -442,7 +446,19 @@ impl JiraTimeApp {
                 }
                 AsyncResult::UpdateApplied => {
                     self.update_applying = false;
-                    self.status_message = Some(("Update downloaded! Restart the app to apply.".to_string(), false));
+                    #[cfg(target_os = "macos")]
+                    {
+                        // macOS quarantines downloaded binaries - user must authorize manually
+                        self.status_message = Some(("Updated! Run: xattr -d com.apple.quarantine <app-path> then restart".to_string(), false));
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        // Restart the app by spawning new process and exiting
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).spawn();
+                            std::process::exit(0);
+                        }
+                    }
                 }
                 AsyncResult::UpdateError(msg) => {
                     self.update_applying = false;
@@ -536,13 +552,20 @@ impl JiraTimeApp {
     }
 
     fn save_settings(&mut self) {
+        // Build full domain from subdomain input
+        let full_domain = if self.settings_domain.contains('.') {
+            self.settings_domain.clone()
+        } else {
+            format!("{}.atlassian.net", self.settings_domain)
+        };
+
         // Check if credentials changed (need to reload if so)
         let credentials_changed =
-            self.config.jira_domain != self.settings_domain
+            self.config.jira_domain != full_domain
             || self.config.email != self.settings_email
             || !self.settings_token.is_empty();
 
-        self.config.jira_domain = self.settings_domain.clone();
+        self.config.jira_domain = full_domain;
         self.config.email = self.settings_email.clone();
         self.config.font_scale = self.settings_font_scale;
         self.config.time_format = self.settings_time_format;
@@ -932,11 +955,14 @@ impl JiraTimeApp {
             .spacing([20.0, 10.0])
             .show(ui, |ui| {
                 ui.label("Jira Domain:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_domain)
-                        .hint_text("company.atlassian.net")
-                        .desired_width(350.0)
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_domain)
+                            .hint_text("company")
+                            .desired_width(200.0)
+                    );
+                    ui.label(".atlassian.net");
+                });
                 ui.end_row();
 
                 ui.label("Email:");
@@ -1102,7 +1128,7 @@ impl JiraTimeApp {
                 ui.painter().text(settings_rect.center(), egui::Align2::CENTER_CENTER, settings_icon, font_id.clone(), settings_col);
                 if settings_response.on_hover_text("Settings").clicked() {
                     // Reset settings to current config values
-                    self.settings_domain = self.config.jira_domain.clone();
+                    self.settings_domain = self.config.jira_domain.trim_end_matches(".atlassian.net").to_string();
                     self.settings_email = self.config.email.clone();
                     self.settings_token = String::new();
                     self.settings_font_scale = self.config.font_scale;
@@ -1254,9 +1280,12 @@ impl JiraTimeApp {
             .spacing([20.0, 10.0])
             .show(ui, |ui| {
                 ui.label("Domain");
-                ui.add(egui::TextEdit::singleline(&mut self.settings_domain)
-                    .hint_text("company.atlassian.net")
-                    .desired_width(350.0));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.settings_domain)
+                        .hint_text("company")
+                        .desired_width(200.0));
+                    ui.label(".atlassian.net");
+                });
                 ui.end_row();
 
                 ui.label("Email");
@@ -1890,6 +1919,47 @@ impl eframe::App for JiraTimeApp {
                 self.pending_delete = None;
                 self.show_delete_confirm = false;
             }
+        }
+
+        // Update overlay - blocks interaction while downloading
+        if self.update_applying {
+            egui::Area::new(egui::Id::new("update_overlay"))
+                .fixed_pos(egui::Pos2::ZERO)
+                .show(ctx, |ui| {
+                    let screen = ctx.screen_rect();
+                    ui.allocate_exact_size(screen.size(), egui::Sense::click()); // Block clicks
+                    let painter = ui.painter();
+                    // Semi-transparent background
+                    painter.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
+
+                    // Centered content
+                    let center = screen.center();
+                    let box_width = 300.0;
+                    let box_height = 80.0;
+                    let box_rect = egui::Rect::from_center_size(center, egui::vec2(box_width, box_height));
+
+                    // Background box
+                    painter.rect_filled(box_rect, 8.0, Color32::from_rgb(0x1e, 0x1e, 0x1e));
+
+                    // "Updating..." text
+                    let text_pos = egui::pos2(center.x, center.y - 15.0);
+                    painter.text(text_pos, egui::Align2::CENTER_CENTER, "Updating...", egui::FontId::proportional(18.0), Color32::WHITE);
+
+                    // Progress bar
+                    let bar_width = box_width - 40.0;
+                    let bar_height = 6.0;
+                    let bar_y = center.y + 15.0;
+                    let bar_bg = egui::Rect::from_center_size(egui::pos2(center.x, bar_y), egui::vec2(bar_width, bar_height));
+                    painter.rect_filled(bar_bg, 3.0, Color32::from_rgb(0x3a, 0x3a, 0x3a));
+
+                    // Progress fill
+                    let fill_width = bar_width * self.progress;
+                    let fill_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_bg.min.x, bar_bg.min.y),
+                        egui::vec2(fill_width, bar_height)
+                    );
+                    painter.rect_filled(fill_rect, 3.0, Color32::from_rgb(0x13, 0x98, 0xf4));
+                });
         }
 
         egui::CentralPanel::default().frame(
