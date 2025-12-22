@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use crate::api::{JiraClient, TimeEntry, Issue, parse_duration, format_duration_with_format, extract_time, parse_date};
 use crate::config::{Config, TimeFormat, ClockFormat, ListViewMode, ViewMode};
+use crate::export;
 use crate::update::{self, UpdateInfo};
 use super::views::{self, week_start, WeekData};
 
@@ -1148,9 +1149,28 @@ impl JiraTimeApp {
                 let icon_size = ui.fonts(|f| f.layout_no_wrap(reload_icon.to_string(), font_id.clone(), Color32::WHITE).size());
                 let (reload_rect, reload_response) = ui.allocate_exact_size(icon_size + egui::vec2(8.0, 4.0), egui::Sense::click());
                 let reload_col = if reload_response.hovered() { hover_color } else { text_color };
-                ui.painter().text(reload_rect.center(), egui::Align2::CENTER_CENTER, reload_icon, font_id, reload_col);
+                ui.painter().text(reload_rect.center(), egui::Align2::CENTER_CENTER, reload_icon, font_id.clone(), reload_col);
                 if reload_response.on_hover_text("Sync with Jira").clicked() {
                     self.refresh_data();
+                }
+
+                ui.add_space(12.0);
+
+                // Export button
+                let export_icon = egui_phosphor::regular::EXPORT;
+                let icon_size = ui.fonts(|f| f.layout_no_wrap(export_icon.to_string(), font_id.clone(), Color32::WHITE).size());
+                let (export_rect, export_response) = ui.allocate_exact_size(icon_size + egui::vec2(8.0, 4.0), egui::Sense::click());
+                let export_col = if export_response.hovered() { hover_color } else { text_color };
+                ui.painter().text(export_rect.center(), egui::Align2::CENTER_CENTER, export_icon, font_id, export_col);
+                if export_response.on_hover_text("Export week to JSON").clicked() {
+                    match export::export_week(&self.week_data) {
+                        Ok(path) => {
+                            self.status_message = Some((format!("Exported to {}", path.display()), false));
+                        }
+                        Err(e) => {
+                            self.status_message = Some((format!("Export failed: {}", e), true));
+                        }
+                    }
                 }
             });
         });
