@@ -176,17 +176,17 @@ fn render_add_button(ui: &mut Ui, is_empty: bool) -> bool {
     let painter = ui.painter();
     let is_hovered = response.hovered();
 
-    // Subtle dashed border, brighter on hover
+    // Blue border, brighter on hover
     let border_color = if is_hovered {
-        Color32::from_rgb(0x70, 0x70, 0x68)
+        Color32::from_rgb(0x61, 0xAF, 0xEF)  // Bright blue
     } else {
-        Color32::from_rgb(0x38, 0x38, 0x34)
+        Color32::from_rgb(0x3A, 0x6E, 0x99)  // Muted blue
     };
 
     painter.rect_stroke(button_rect, 8.0, egui::Stroke::new(2.0, border_color));
 
-    // Plus icon
-    let icon_color = if is_hovered { Color32::WHITE } else { Color32::from_rgb(0x90, 0x90, 0x88) };
+    // Blue plus icon, white on hover
+    let icon_color = if is_hovered { Color32::WHITE } else { Color32::from_rgb(0x61, 0xAF, 0xEF) };
     let icon_size = if is_empty { 32.0 } else { 24.0 };
 
     painter.text(
