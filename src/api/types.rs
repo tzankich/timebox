@@ -289,7 +289,8 @@ fn extract_list_item_markdown(node: &serde_json::Value, lines: &mut Vec<String>,
     }
 }
 
-/// Parse time strings like "1h 30m", "2h", "45m", "1.5h", "90" (minutes)
+/// Parse time strings like "1h 30m", "2h", "45m", "1.5h", "90" (minutes), "4" (hours)
+/// Bare integers 1-8 are treated as hours, 9+ as minutes
 /// Returns seconds
 pub fn parse_duration(input: &str) -> Option<i64> {
     let input = input.trim().to_lowercase();
@@ -337,12 +338,18 @@ pub fn parse_duration(input: &str) -> Option<i64> {
                 // If we already had units, trailing number is invalid
                 return None;
             }
-            // Bare number: if it has decimal, treat as hours, otherwise minutes
+            // Bare number: if it has decimal, treat as hours
+            // If integer 1-8, treat as hours (nobody logs 3 minutes)
+            // If integer 9+, treat as minutes
             if current_num.contains('.') {
                 total_seconds = (num * 3600.0) as i64;
             } else {
-                // Bare integer - treat as minutes for convenience
-                total_seconds = (num * 60.0) as i64;
+                let int_val = num as i64;
+                if int_val >= 1 && int_val <= 8 {
+                    total_seconds = int_val * 3600;
+                } else {
+                    total_seconds = (num * 60.0) as i64;
+                }
             }
         }
     }

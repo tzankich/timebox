@@ -172,7 +172,8 @@ The duration field accepts flexible input:
 | `1h30m` | 1 hour 30 minutes |
 | `1.5h` | 1 hour 30 minutes |
 | `90m` | 1 hour 30 minutes |
-| `90` | 90 minutes |
+| `4` | 4 hours (1-8 = hours) |
+| `90` | 90 minutes (9+ = minutes) |
 | `1.5` | 1.5 hours |
 
 ## Troubleshooting

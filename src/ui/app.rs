@@ -1156,14 +1156,14 @@ impl JiraTimeApp {
 
                 ui.add_space(12.0);
 
-                // Export button
-                let export_icon = egui_phosphor::regular::EXPORT;
+                // Export button (JSON icon)
+                let export_icon = egui_phosphor::regular::BRACKETS_CURLY;
                 let icon_size = ui.fonts(|f| f.layout_no_wrap(export_icon.to_string(), font_id.clone(), Color32::WHITE).size());
                 let (export_rect, export_response) = ui.allocate_exact_size(icon_size + egui::vec2(8.0, 4.0), egui::Sense::click());
                 let export_col = if export_response.hovered() { hover_color } else { text_color };
                 ui.painter().text(export_rect.center(), egui::Align2::CENTER_CENTER, export_icon, font_id, export_col);
                 if export_response.on_hover_text("Export week to JSON").clicked() {
-                    match export::export_week(&self.week_data) {
+                    match export::export_week(&self.week_data, None) {
                         Ok(path) => {
                             self.status_message = Some((format!("Exported to {}", path.display()), false));
                         }
