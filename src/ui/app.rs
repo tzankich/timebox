@@ -56,6 +56,14 @@ pub struct JiraTimeApp {
     pending_delete: Option<TimeEntry>,
     show_delete_confirm: bool,
 
+    // Schedule reschedule dialog
+    show_reschedule_dialog: bool,
+    reschedule_entry: Option<TimeEntry>,
+    reschedule_date: NaiveDate,
+    reschedule_time: String,
+    reschedule_duration: String,
+    reschedule_is_clone: bool,  // true = clone to new day, false = move
+
     // Settings dialog
     show_settings: bool,
     settings_domain: String,
@@ -179,6 +187,12 @@ impl JiraTimeApp {
             dialog_accent_color: None,
             pending_delete: None,
             show_delete_confirm: false,
+            show_reschedule_dialog: false,
+            reschedule_entry: None,
+            reschedule_date: today,
+            reschedule_time: String::new(),
+            reschedule_duration: String::new(),
+            reschedule_is_clone: false,
             status_message: None,
             loading: false,
             is_offline: false,
@@ -1285,6 +1299,130 @@ impl JiraTimeApp {
                     self.open_add_dialog();
                     self.dialog_start_time = start_time;
                 }
+
+                // Handle drag move - optimistic update + async Jira call
+                if let Some((entry, new_start_time)) = schedule_result.drag_move {
+                    // Optimistic update: immediately update the local entry
+                    if let Some(existing) = self.week_data.entries.iter_mut()
+                        .find(|e| e.worklog_id == entry.worklog_id)
+                    {
+                        existing.start_time = new_start_time.clone();
+                    }
+                    // Re-sort entries by date and time
+                    self.week_data.entries.sort_by(|a, b| {
+                        a.date.cmp(&b.date).then(a.start_time.cmp(&b.start_time))
+                    });
+
+                    // Async Jira update
+                    let config = self.config.clone();
+                    let tx = self.result_tx.clone();
+                    let new_time = new_start_time.clone();
+                    let entry_clone = entry.clone();
+
+                    self.runtime.spawn(async move {
+                        let result: Result<(String, TimeEntry, bool), anyhow::Error> = async {
+                            let client = JiraClient::new(&config)?;
+                            let worklog = client.update_worklog(
+                                &entry_clone.issue_key,
+                                &entry_clone.worklog_id,
+                                entry_clone.seconds,
+                                &entry_clone.description,
+                                entry_clone.date,
+                                Some(&new_time),
+                            ).await?;
+                            let start_time = extract_time(&worklog.started);
+                            let updated_entry = TimeEntry {
+                                worklog_id: entry_clone.worklog_id.clone(),
+                                issue_key: entry_clone.issue_key.clone(),
+                                issue_summary: entry_clone.issue_summary.clone(),
+                                issue_type: entry_clone.issue_type.clone(),
+                                seconds: entry_clone.seconds,
+                                description: entry_clone.description.clone(),
+                                date: entry_clone.date,
+                                start_time,
+                            };
+                            Ok((format!("Moved to {}", new_time), updated_entry, true))
+                        }.await;
+
+                        match result {
+                            Ok((msg, entry, is_edit)) => {
+                                let _ = tx.send(AsyncResult::WorklogSaved(msg, entry, is_edit));
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string().to_lowercase();
+                                if err_str.contains("connection") || err_str.contains("network")
+                                   || err_str.contains("error sending request") || err_str.contains("timeout") {
+                                    let _ = tx.send(AsyncResult::Offline);
+                                } else {
+                                    let _ = tx.send(AsyncResult::Error(format!("Move failed: {}", e)));
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // Handle drag resize - optimistic update + async Jira call
+                if let Some((entry, new_start_time, new_seconds)) = schedule_result.drag_resize {
+                    // Optimistic update: immediately update the local entry
+                    if let Some(existing) = self.week_data.entries.iter_mut()
+                        .find(|e| e.worklog_id == entry.worklog_id)
+                    {
+                        existing.start_time = new_start_time.clone();
+                        existing.seconds = new_seconds;
+                    }
+                    // Re-sort entries by date and time
+                    self.week_data.entries.sort_by(|a, b| {
+                        a.date.cmp(&b.date).then(a.start_time.cmp(&b.start_time))
+                    });
+
+                    // Async Jira update
+                    let config = self.config.clone();
+                    let tx = self.result_tx.clone();
+                    let new_time = new_start_time.clone();
+                    let entry_clone = entry.clone();
+
+                    self.runtime.spawn(async move {
+                        let result: Result<(String, TimeEntry, bool), anyhow::Error> = async {
+                            let client = JiraClient::new(&config)?;
+                            let worklog = client.update_worklog(
+                                &entry_clone.issue_key,
+                                &entry_clone.worklog_id,
+                                new_seconds,
+                                &entry_clone.description,
+                                entry_clone.date,
+                                Some(&new_time),
+                            ).await?;
+                            let start_time = extract_time(&worklog.started);
+                            let updated_entry = TimeEntry {
+                                worklog_id: entry_clone.worklog_id.clone(),
+                                issue_key: entry_clone.issue_key.clone(),
+                                issue_summary: entry_clone.issue_summary.clone(),
+                                issue_type: entry_clone.issue_type.clone(),
+                                seconds: new_seconds,
+                                description: entry_clone.description.clone(),
+                                date: entry_clone.date,
+                                start_time,
+                            };
+                            let duration_str = crate::api::format_duration_with_format(new_seconds, crate::config::TimeFormat::Decimal);
+                            Ok((format!("Resized to {}", duration_str), updated_entry, true))
+                        }.await;
+
+                        match result {
+                            Ok((msg, entry, is_edit)) => {
+                                let _ = tx.send(AsyncResult::WorklogSaved(msg, entry, is_edit));
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string().to_lowercase();
+                                if err_str.contains("connection") || err_str.contains("network")
+                                   || err_str.contains("error sending request") || err_str.contains("timeout") {
+                                    let _ = tx.send(AsyncResult::Offline);
+                                } else {
+                                    let _ = tx.send(AsyncResult::Error(format!("Resize failed: {}", e)));
+                                }
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -1523,7 +1661,9 @@ impl eframe::App for JiraTimeApp {
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(egui::Margin::same(20.0));
 
+            let mut dialog_open = true;
             egui::Window::new(title)
+                .open(&mut dialog_open)
                 .collapsible(false)
                 .resizable(true)
                 .default_width(600.0)
@@ -1727,23 +1867,23 @@ impl eframe::App for JiraTimeApp {
                     ui.add_space(15.0);
                     ui.label("Description");
 
-                    // Category tags as small, minimal chips - dark by default, bright when selected
+                    // Category tags as small, minimal chips - blue text by default, white on blue when selected
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         for (i, tag) in self.config.tags.iter().enumerate() {
                             let selected = self.dialog_categories.get(i).copied().unwrap_or(false);
-                            let font_id = egui::FontId::proportional(18.0);
+                            let font_id = egui::FontId::proportional(13.0);
                             let text_size = ui.fonts(|f| f.layout_no_wrap(tag.to_string(), font_id.clone(), Color32::WHITE).size());
-                            let padding = egui::vec2(8.0, 4.0);
+                            let padding = egui::vec2(6.0, 3.0);
                             let button_size = text_size + padding * 2.0;
 
                             let (rect, response) = ui.allocate_exact_size(button_size, egui::Sense::click());
 
-                            // Draw tag - dark by default, bright blue when selected
+                            // Draw tag - blue text by default, white on blue when selected
                             let (text_color, bg_color) = if selected {
                                 (Color32::WHITE, Color32::from_rgb(19, 152, 244))
                             } else {
-                                (Color32::from_rgb(120, 120, 130), Color32::TRANSPARENT)
+                                (Color32::from_rgb(19, 152, 244), Color32::TRANSPARENT)  // Blue text
                             };
 
                             if selected {
@@ -1845,7 +1985,7 @@ impl eframe::App for JiraTimeApp {
                 self.validated_issue = Some((key, summary, issue_type));
                 self.show_suggestions = false;
             }
-            if close_requested {
+            if close_requested || !dialog_open {
                 self.show_dialog = false;
             }
         }
@@ -1859,7 +1999,9 @@ impl eframe::App for JiraTimeApp {
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(egui::Margin::same(20.0));
 
+            let mut settings_open = true;
             egui::Window::new("Settings")
+                .open(&mut settings_open)
                 .collapsible(false)
                 .resizable(false)
                 .default_width(750.0)
@@ -1868,6 +2010,9 @@ impl eframe::App for JiraTimeApp {
                 .show(ctx, |ui| {
                     self.render_settings_with_colors(ui, frame_color, frame_text);
                 });
+            if !settings_open {
+                self.show_settings = false;
+            }
         }
 
         // Render delete confirmation dialog
@@ -1882,7 +2027,9 @@ impl eframe::App for JiraTimeApp {
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(egui::Margin::same(20.0));
 
+            let mut delete_dialog_open = true;
             egui::Window::new("Confirm Delete")
+                .open(&mut delete_dialog_open)
                 .collapsible(false)
                 .resizable(false)
                 .default_width(400.0)
@@ -1944,9 +2091,178 @@ impl eframe::App for JiraTimeApp {
                 }
                 self.show_delete_confirm = false;
             }
-            if cancel_delete {
+            if cancel_delete || !delete_dialog_open {
                 self.pending_delete = None;
                 self.show_delete_confirm = false;
+            }
+        }
+
+        // Render reschedule dialog
+        if self.show_reschedule_dialog {
+            let mut do_save = false;
+            let mut cancel_reschedule = false;
+
+            let (content_bg, frame_color, _) = super::theme::dialog_colors();
+            let dialog_frame = egui::Frame::none()
+                .fill(content_bg)
+                .stroke(egui::Stroke::new(2.0, frame_color))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::same(20.0));
+
+            let title = if self.reschedule_is_clone { "Copy Entry" } else { "Move Entry" };
+
+            let mut reschedule_dialog_open = true;
+            egui::Window::new(title)
+                .open(&mut reschedule_dialog_open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(350.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(dialog_frame)
+                .show(ctx, |ui| {
+                    ui.add_space(10.0);
+
+                    if let Some(entry) = &self.reschedule_entry {
+                        // Show entry info
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&entry.issue_key).strong());
+                            ui.label("-");
+                            ui.add(egui::Label::new(&entry.issue_summary).truncate());
+                        });
+                        ui.add_space(10.0);
+
+                        // Start time field
+                        ui.horizontal(|ui| {
+                            ui.label("Start time:");
+                            ui.add(egui::TextEdit::singleline(&mut self.reschedule_time)
+                                .hint_text("HH:MM")
+                                .desired_width(80.0));
+                        });
+
+                        ui.add_space(8.0);
+
+                        // Duration field (optional)
+                        ui.horizontal(|ui| {
+                            ui.label("Duration:");
+                            ui.add(egui::TextEdit::singleline(&mut self.reschedule_duration)
+                                .hint_text("leave blank to keep")
+                                .desired_width(150.0));
+                        });
+                    }
+
+                    ui.add_space(20.0);
+
+                    ui.horizontal(|ui| {
+                        let btn_bg = Color32::from_rgb(0x28, 0x28, 0x26);
+                        let btn_hover = Color32::from_rgb(0x50, 0x50, 0x4a);
+                        let text_color = Color32::from_rgb(180, 180, 190);
+                        let save_color = Color32::from_rgb(152, 195, 121);
+                        let font_id = egui::FontId::proportional(17.0);
+                        let padding = egui::vec2(18.0, 10.0);
+                        let rounding = egui::Rounding::same(6.0);
+
+                        // Save button
+                        let save_text = if self.reschedule_is_clone { "Copy" } else { "Move" };
+                        let save_size = ui.fonts(|f| f.layout_no_wrap(save_text.to_string(), font_id.clone(), save_color).size());
+                        let (save_rect, save_response) = ui.allocate_exact_size(save_size + padding * 2.0, egui::Sense::click());
+                        let save_bg = if save_response.hovered() { btn_hover } else { btn_bg };
+                        ui.painter().rect_filled(save_rect, rounding, save_bg);
+                        ui.painter().text(save_rect.center(), egui::Align2::CENTER_CENTER, save_text, font_id.clone(), save_color);
+                        if save_response.clicked() {
+                            do_save = true;
+                        }
+
+                        // Cancel button
+                        let cancel_text = "Cancel";
+                        let cancel_size = ui.fonts(|f| f.layout_no_wrap(cancel_text.to_string(), font_id.clone(), text_color).size());
+                        let (cancel_rect, cancel_response) = ui.allocate_exact_size(cancel_size + padding * 2.0, egui::Sense::click());
+                        let cancel_bg = if cancel_response.hovered() { btn_hover } else { btn_bg };
+                        ui.painter().rect_filled(cancel_rect, rounding, cancel_bg);
+                        ui.painter().text(cancel_rect.center(), egui::Align2::CENTER_CENTER, cancel_text, font_id, text_color);
+                        if cancel_response.clicked() {
+                            cancel_reschedule = true;
+                        }
+                    });
+                });
+
+            if do_save {
+                if let Some(entry) = self.reschedule_entry.take() {
+                    // Parse new duration if provided
+                    let new_seconds = if self.reschedule_duration.is_empty() {
+                        entry.seconds
+                    } else {
+                        crate::api::parse_duration(&self.reschedule_duration).unwrap_or(entry.seconds)
+                    };
+
+                    self.loading = true;
+                    self.progress = 0.0;
+                    self.progress_phase = ProgressPhase::FastStart;
+                    self.progress_start = std::time::Instant::now();
+
+                    let config = self.config.clone();
+                    let tx = self.result_tx.clone();
+                    let is_clone = self.reschedule_is_clone;
+                    let new_date = self.reschedule_date;
+                    let new_time = self.reschedule_time.clone();
+                    let duration_str = format_duration_with_format(new_seconds, self.config.time_format);
+
+                    self.runtime.spawn(async move {
+                        let result: Result<(String, TimeEntry, bool), anyhow::Error> = async {
+                            let client = JiraClient::new(&config)?;
+                            if is_clone {
+                                // Clone: create new worklog on new date
+                                let worklog = client.log_time(&entry.issue_key, new_seconds, new_date, &entry.description, Some(&new_time)).await?;
+                                let start_time = extract_time(&worklog.started);
+                                let new_entry = TimeEntry {
+                                    worklog_id: worklog.id,
+                                    issue_key: entry.issue_key.clone(),
+                                    issue_summary: entry.issue_summary.clone(),
+                                    issue_type: entry.issue_type.clone(),
+                                    seconds: new_seconds,
+                                    description: entry.description.clone(),
+                                    date: new_date,
+                                    start_time,
+                                };
+                                Ok((format!("Copied {} to {}", duration_str, new_date.format("%a")), new_entry, false))
+                            } else {
+                                // Move: update existing worklog with new time
+                                let worklog = client.update_worklog(&entry.issue_key, &entry.worklog_id, new_seconds, &entry.description, new_date, Some(&new_time)).await?;
+                                let start_time = extract_time(&worklog.started);
+                                let updated_entry = TimeEntry {
+                                    worklog_id: entry.worklog_id.clone(),
+                                    issue_key: entry.issue_key.clone(),
+                                    issue_summary: entry.issue_summary.clone(),
+                                    issue_type: entry.issue_type.clone(),
+                                    seconds: new_seconds,
+                                    description: entry.description.clone(),
+                                    date: new_date,
+                                    start_time,
+                                };
+                                Ok((format!("Moved to {}", new_time), updated_entry, true))
+                            }
+                        }.await;
+
+                        match result {
+                            Ok((msg, entry, is_edit)) => {
+                                let _ = tx.send(AsyncResult::WorklogSaved(msg, entry, is_edit));
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string().to_lowercase();
+                                if err_str.contains("connection") || err_str.contains("network")
+                                   || err_str.contains("error sending request") || err_str.contains("timeout") {
+                                    let _ = tx.send(AsyncResult::Offline);
+                                } else {
+                                    let _ = tx.send(AsyncResult::Error(format!("Failed: {}", e)));
+                                }
+                            }
+                        }
+                    });
+                }
+                self.show_reschedule_dialog = false;
+            }
+            if cancel_reschedule || !reschedule_dialog_open {
+                self.reschedule_entry = None;
+                self.show_reschedule_dialog = false;
             }
         }
 
@@ -2015,45 +2331,51 @@ impl eframe::App for JiraTimeApp {
                 painter.rect_filled(bar_rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, alpha));
             }
 
-            // Status message (errors only) - selectable with copy and close buttons
+            // Status message toast - inverted colors (colored background, dark text)
             let mut dismiss_message = false;
             let mut copy_message: Option<String> = None;
             if !self.loading {
                 if let Some((msg, is_error)) = &self.status_message {
-                    let color = if *is_error {
-                        Color32::from_rgb(224, 108, 117)
+                    let bg_color = if *is_error {
+                        Color32::from_rgb(224, 108, 117)  // Red background
                     } else {
-                        Color32::from_rgb(152, 195, 121)
+                        Color32::from_rgb(152, 195, 121)  // Green background
                     };
-                    let dim_color = Color32::from_rgb(120, 120, 130);
-                    ui.horizontal(|ui| {
-                        // Selectable text (can copy manually)
-                        ui.add(egui::Label::new(RichText::new(msg).color(color)));
+                    let text_color = Color32::from_rgb(30, 30, 30);  // Dark text
 
-                        ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Label::new(RichText::new(msg).color(text_color)));
 
-                        // Copy button
-                        let copy_btn = ui.add(egui::Label::new(
-                            RichText::new(egui_phosphor::regular::COPY).size(14.0).color(dim_color)
-                        ).sense(egui::Sense::click()));
-                        if copy_btn.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if copy_btn.clicked() {
-                            copy_message = Some(msg.clone());
-                        }
+                                ui.add_space(8.0);
 
-                        // Close button
-                        let close_btn = ui.add(egui::Label::new(
-                            RichText::new(egui_phosphor::regular::X).size(14.0).color(dim_color)
-                        ).sense(egui::Sense::click()));
-                        if close_btn.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if close_btn.clicked() {
-                            dismiss_message = true;
-                        }
-                    });
+                                // Copy button
+                                let copy_btn = ui.add(egui::Label::new(
+                                    RichText::new(egui_phosphor::regular::COPY).size(14.0).color(text_color)
+                                ).sense(egui::Sense::click()));
+                                if copy_btn.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if copy_btn.clicked() {
+                                    copy_message = Some(msg.clone());
+                                }
+
+                                // Close button
+                                let close_btn = ui.add(egui::Label::new(
+                                    RichText::new(egui_phosphor::regular::X).size(14.0).color(text_color)
+                                ).sense(egui::Sense::click()));
+                                if close_btn.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if close_btn.clicked() {
+                                    dismiss_message = true;
+                                }
+                            });
+                        });
                     ui.add_space(8.0);
                 }
             }

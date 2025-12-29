@@ -11,6 +11,13 @@ pub struct ScheduleResult {
     pub edit_entry: Option<TimeEntry>,
     pub delete_entry: Option<TimeEntry>,
     pub add_at: Option<(NaiveDate, String)>,  // (date, start_time "HH:MM")
+    // Drag move completed - entry moved to new time (optimistic update)
+    pub drag_move: Option<(TimeEntry, String)>,  // (entry, new_start_time "HH:MM")
+    // Drag resize completed - entry start/duration changed (optimistic update)
+    pub drag_resize: Option<(TimeEntry, String, i64)>,  // (entry, new_start_time, new_seconds)
+    // Ghost preview for new entries
+    pub ghost_position: Option<(NaiveDate, String)>,  // (date, time) - where ghost should appear
+    pub ghost_clicked: bool,  // User clicked on the ghost
 }
 
 /// Issue type icon style
@@ -724,10 +731,13 @@ pub fn render_day_tabs(
             };
 
             let seconds = week_data.seconds_for_day(day);
+            let is_future = day > today;
 
-            // Show "0" for zero duration (no units), formatted duration otherwise
+            // Show "0" for zero duration on past/current days, nothing for future days
             let hours_text = if seconds > 0 {
                 format_duration_with_format(seconds, time_format)
+            } else if is_future {
+                String::new()  // Hide "0" on future days
             } else {
                 "0".to_string()
             };
@@ -913,10 +923,13 @@ pub fn render_schedule_view(
             }
         };
 
-        // Daily total
+        // Daily total - hide "0" on future days
         let seconds = week_data.seconds_for_day(*day);
+        let is_future = *day > today;
         let hours_text = if seconds > 0 {
             crate::api::format_duration_with_format(seconds, time_format)
+        } else if is_future {
+            String::new()
         } else {
             "0".to_string()
         };
@@ -967,6 +980,19 @@ pub fn render_schedule_view(
         );
 
         let painter = ui.painter();
+
+        // Highlight current day column with dim background
+        for (i, day) in days.iter().enumerate() {
+            if *day == today {
+                let col_x = grid_rect.min.x + hour_label_width + i as f32 * day_width;
+                let col_rect = egui::Rect::from_min_size(
+                    egui::pos2(col_x, grid_rect.min.y),
+                    egui::vec2(day_width, total_grid_height)
+                );
+                painter.rect_filled(col_rect, 0.0, Color32::from_rgb(0x11, 0x11, 0x10));
+                break;
+            }
+        }
 
         // Vertical grid lines for columns
         for (i, _day) in days.iter().enumerate() {
@@ -1038,6 +1064,34 @@ pub fn render_schedule_view(
         let start_minutes = schedule_start_hour as i32 * 60;
         let end_minutes = schedule_end_hour as i32 * 60;
 
+        // First pass: collect all entry rects and render them
+        let mut all_entry_rects: Vec<egui::Rect> = Vec::new();
+
+        // Drag state: (entry, original_start_minutes, original_end_minutes, press_time, original_col_x, drag_mode)
+        // drag_mode: 0=move, 1=resize-top (change start), 2=resize-bottom (change duration)
+        // Use egui memory to persist across frames
+        let drag_id = ui.id().with("schedule_drag");
+        type DragState = (TimeEntry, i32, i32, f64, f32, u8);
+        let grabbed_state: Option<DragState> = ui.ctx().memory(|mem| {
+            mem.data.get_temp::<DragState>(drag_id).clone()
+        });
+
+        let current_time = ui.ctx().input(|i| i.time);
+        let long_press_threshold = 0.2; // 200ms for long-press to initiate drag
+        let edge_threshold = 8.0; // pixels from edge to trigger resize mode
+
+        // Check if we're in drag mode (past threshold)
+        let in_drag_mode = grabbed_state.as_ref().map(|(_, _, _, press_time, _, _)| {
+            current_time - press_time > long_press_threshold
+        }).unwrap_or(false);
+
+        // Get the dragged entry's worklog_id to skip rendering it at original position
+        let dragged_worklog_id = if in_drag_mode {
+            grabbed_state.as_ref().map(|(e, _, _, _, _, _)| e.worklog_id.clone())
+        } else {
+            None
+        };
+
         for (day_idx, day) in days.iter().enumerate() {
             let day_entries = week_data.entries_for_day(*day);
             let col_x = grid_rect.min.x + hour_label_width + day_idx as f32 * day_width;
@@ -1068,29 +1122,249 @@ pub fn render_schedule_view(
                     egui::vec2(day_width - block_margin * 2.0, (height - 2.0).max(20.0))
                 );
 
-                // Render entry block
-                let interaction = render_schedule_entry(
-                    ui,
-                    block_rect,
-                    entry,
-                    time_format,
-                );
+                all_entry_rects.push(block_rect);
 
-                if interaction.double_clicked {
-                    result.edit_entry = Some(entry.clone());
+                // Skip rendering if this entry is being dragged (we'll render it at mouse position)
+                let is_being_dragged = dragged_worklog_id.as_ref() == Some(&entry.worklog_id);
+                if !is_being_dragged {
+                    // Render the entry (paint only)
+                    render_schedule_entry_paint(ui, block_rect, entry, time_format);
+                }
+
+                // Check if pointer is over this entry manually
+                let pointer_pos = ui.ctx().pointer_hover_pos();
+                let pointer_over_entry = pointer_pos
+                    .map(|pos| block_rect.contains(pos))
+                    .unwrap_or(false);
+
+                // Detect edge proximity for resize cursor
+                let (near_top_edge, near_bottom_edge) = if let Some(pos) = pointer_pos {
+                    if block_rect.contains(pos) {
+                        let dist_from_top = pos.y - block_rect.min.y;
+                        let dist_from_bottom = block_rect.max.y - pos.y;
+                        (dist_from_top < edge_threshold, dist_from_bottom < edge_threshold)
+                    } else {
+                        (false, false)
+                    }
+                } else {
+                    (false, false)
+                };
+
+                // Check if primary button JUST went down this frame
+                let button_just_pressed = ui.ctx().input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+
+                // Capture entry when click starts on it - store in memory with press time and drag mode
+                if pointer_over_entry && button_just_pressed && grabbed_state.is_none() {
+                    let drag_mode: u8 = if near_top_edge {
+                        1 // resize-top
+                    } else if near_bottom_edge {
+                        2 // resize-bottom
+                    } else {
+                        0 // move
+                    };
+                    ui.ctx().memory_mut(|mem| {
+                        mem.data.insert_temp(drag_id, (entry.clone(), entry_start_minutes, entry_end_minutes, current_time, col_x, drag_mode));
+                    });
+                }
+
+                // Show appropriate cursor when hovering over entry (not during drag)
+                if pointer_over_entry && !in_drag_mode {
+                    if near_top_edge || near_bottom_edge {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    } else {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                    }
                 }
             }
+        }
 
-            // Handle double-click on empty space to add entry
+        // Handle grabbed entry (click, drag, or resize)
+        if let Some((entry, original_start_minutes, original_end_minutes, press_time, original_col_x, drag_mode)) = grabbed_state {
+            let primary_down = ui.ctx().input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released = ui.ctx().input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+            let right_clicked = ui.ctx().input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+            let esc_pressed = ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
+
+            let held_duration = current_time - press_time;
+            let is_long_press = held_duration > long_press_threshold;
+
+            // Get current pointer position
+            let current_pos = ui.ctx().input(|i| i.pointer.latest_pos()).unwrap_or(egui::Pos2::ZERO);
+
+            // Calculate snapped time at current position (5-minute intervals)
+            let relative_y = (current_pos.y - grid_rect.min.y).max(0.0);
+            let hover_minutes = start_minutes + (relative_y / pixels_per_minute) as i32;
+            let snapped_minutes = ((hover_minutes + 2) / 5) * 5; // Round to nearest 5 min
+            let snapped_minutes = snapped_minutes.max(start_minutes).min(end_minutes - 5);
+
+            // Calculate new values based on drag mode
+            let min_duration_minutes = 15; // Minimum 15-minute duration
+            let (new_start_minutes, new_end_minutes) = match drag_mode {
+                1 => {
+                    // Resize-top: change start time, keep end fixed
+                    let clamped_start = snapped_minutes.min(original_end_minutes - min_duration_minutes);
+                    (clamped_start, original_end_minutes)
+                }
+                2 => {
+                    // Resize-bottom: keep start fixed, change end time
+                    let clamped_end = snapped_minutes.max(original_start_minutes + min_duration_minutes);
+                    (original_start_minutes, clamped_end)
+                }
+                _ => {
+                    // Move: shift both start and end by same amount
+                    let duration = original_end_minutes - original_start_minutes;
+                    (snapped_minutes, snapped_minutes + duration)
+                }
+            };
+
+            let new_hour = new_start_minutes / 60;
+            let new_minute = new_start_minutes % 60;
+            let new_start_time = format!("{:02}:{:02}", new_hour, new_minute);
+            let new_duration_seconds = ((new_end_minutes - new_start_minutes) * 60) as i64;
+
+            // Right-click or Esc cancels drag
+            if right_clicked || esc_pressed {
+                ui.ctx().memory_mut(|mem| {
+                    mem.data.remove::<DragState>(drag_id);
+                });
+            }
+            // Primary released
+            else if primary_released {
+                // Clear state
+                ui.ctx().memory_mut(|mem| {
+                    mem.data.remove::<DragState>(drag_id);
+                });
+
+                if is_long_press {
+                    match drag_mode {
+                        1 | 2 => {
+                            // Resize complete
+                            if new_start_minutes != original_start_minutes || new_end_minutes != original_end_minutes {
+                                result.drag_resize = Some((entry, new_start_time, new_duration_seconds));
+                            }
+                        }
+                        _ => {
+                            // Move complete
+                            if new_start_minutes != original_start_minutes {
+                                result.drag_move = Some((entry, new_start_time));
+                            }
+                        }
+                    }
+                } else {
+                    // Quick click = open edit dialog
+                    result.edit_entry = Some(entry);
+                }
+            }
+            // Still holding - render drag preview if past threshold
+            else if primary_down && is_long_press {
+                // Set appropriate cursor
+                match drag_mode {
+                    1 | 2 => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
+                    _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing),
+                }
+
+                // Calculate ghost rect at new position
+                let ghost_y = grid_rect.min.y + (new_start_minutes - start_minutes) as f32 * pixels_per_minute;
+                let ghost_height = (new_end_minutes - new_start_minutes) as f32 * pixels_per_minute;
+
+                let block_margin = 2.0;
+                let ghost_rect = egui::Rect::from_min_size(
+                    egui::pos2(original_col_x + block_margin, ghost_y),
+                    egui::vec2(day_width - block_margin * 2.0, (ghost_height - 2.0).max(20.0))
+                );
+
+                // Render the entry at the new position (as ghost)
+                // For bottom-edge resize, show duration; otherwise show start time
+                let display_text = if drag_mode == 2 {
+                    format_duration_with_format(new_duration_seconds, time_format)
+                } else {
+                    new_start_time.clone()
+                };
+                render_schedule_entry_ghost(ui, ghost_rect, &entry, time_format, &display_text);
+            }
+        }
+
+        // Second pass: handle column interactions (only for empty space)
+        // Check if we're currently dragging an existing entry (from memory)
+        let is_dragging_entry: bool = ui.ctx().memory(|mem| {
+            mem.data.get_temp::<DragState>(drag_id).is_some()
+        }) && in_drag_mode;
+
+        for (day_idx, day) in days.iter().enumerate() {
+            let col_x = grid_rect.min.x + hour_label_width + day_idx as f32 * day_width;
+
+            // Check if pointer is over any entry in this column
+            let pointer_pos = ui.ctx().pointer_hover_pos();
+            let over_entry = pointer_pos.map(|pos| {
+                all_entry_rects.iter().any(|r| r.contains(pos))
+            }).unwrap_or(false);
+
+            // Handle interactions on empty space
             let col_rect = egui::Rect::from_min_size(
                 egui::pos2(col_x, grid_rect.min.y),
                 egui::vec2(day_width, total_grid_height)
             );
 
-            let col_response = ui.interact(col_rect, ui.id().with(("day_col", day_idx)), egui::Sense::click());
+            let col_response = ui.interact(col_rect, ui.id().with(("day_col", day_idx)), egui::Sense::click_and_drag());
 
-            if col_response.double_clicked() {
-                // Calculate clicked time
+            // Track hover position for ghost preview (only if not over an entry AND not dragging an existing entry)
+            if col_response.hovered() && !over_entry && !is_dragging_entry {
+                if let Some(pos) = ui.ctx().pointer_hover_pos() {
+                    if pos.y >= grid_rect.min.y && pos.y <= grid_rect.max.y {
+                        let relative_y = pos.y - grid_rect.min.y;
+                        let hover_minutes = start_minutes + (relative_y / pixels_per_minute) as i32;
+                        let hour = hover_minutes / 60;
+                        let minute = hover_minutes % 60;
+                        // Snap to 15-minute intervals
+                        let snapped_minute = (minute / 15) * 15;
+                        let ghost_time = format!("{:02}:{:02}", hour, snapped_minute);
+
+                        // Check if ghost would overlap existing entries (1 hour = 60 mins)
+                        let day_entries = week_data.entries_for_day(*day);
+                        if !check_time_overlap(&day_entries, &ghost_time, 60) {
+                            result.ghost_position = Some((*day, ghost_time.clone()));
+
+                            // Render the ghost preview
+                            let ghost_start_minutes = hour * 60 + snapped_minute;
+                            let ghost_y = grid_rect.min.y + (ghost_start_minutes - start_minutes) as f32 * pixels_per_minute;
+                            let ghost_height = 60.0 * pixels_per_minute; // 1 hour
+
+                            let ghost_rect = egui::Rect::from_min_size(
+                                egui::pos2(col_x + 2.0, ghost_y),
+                                egui::vec2(day_width - 4.0, ghost_height)
+                            );
+
+                            // Draw translucent ghost block
+                            let ghost_color = Color32::from_rgba_unmultiplied(0x61, 0xAF, 0xEF, 60);
+                            let ghost_border = Color32::from_rgba_unmultiplied(0x61, 0xAF, 0xEF, 120);
+                            ui.painter().rect(ghost_rect, 4.0, ghost_color, egui::Stroke::new(1.0, ghost_border));
+
+                            // Ghost label
+                            let ghost_label = format!("{} + 1h", ghost_time);
+                            ui.painter().text(
+                                ghost_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                ghost_label,
+                                egui::FontId::proportional(13.0),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Single-click on ghost creates entry (only if not over an existing entry)
+            if col_response.clicked() && !over_entry {
+                if let Some((_, ref time)) = result.ghost_position {
+                    if *day == result.ghost_position.as_ref().unwrap().0 {
+                        result.ghost_clicked = true;
+                        result.add_at = Some((*day, time.clone()));
+                    }
+                }
+            }
+
+            // Double-click on empty space creates entry (not over existing entry)
+            if col_response.double_clicked() && !over_entry {
                 if let Some(pos) = col_response.interact_pointer_pos() {
                     let relative_y = pos.y - grid_rect.min.y;
                     let clicked_minutes = start_minutes + (relative_y / pixels_per_minute) as i32;
@@ -1119,21 +1393,34 @@ fn parse_time_to_minutes(time: &str) -> i32 {
     0
 }
 
-/// Result from rendering a schedule entry
-struct EntryInteraction {
-    double_clicked: bool,  // True when double-clicked (to edit)
+/// Check if a time slot overlaps with any existing entries
+fn check_time_overlap(
+    entries: &[&crate::api::TimeEntry],
+    start_time: &str,
+    duration_mins: i32,
+) -> bool {
+    let new_start = parse_time_to_minutes(start_time);
+    let new_end = new_start + duration_mins;
+
+    for entry in entries {
+        let entry_start = parse_time_to_minutes(&entry.start_time);
+        let entry_end = entry_start + (entry.seconds / 60) as i32;
+
+        // Check for overlap: new block starts before entry ends AND new block ends after entry starts
+        if new_start < entry_end && new_end > entry_start {
+            return true;
+        }
+    }
+    false
 }
 
-/// Render a single entry block in the schedule view
-fn render_schedule_entry(
+/// Paint a single entry block in the schedule view (no interaction - that's handled by caller)
+fn render_schedule_entry_paint(
     ui: &mut Ui,
     rect: egui::Rect,
     entry: &crate::api::TimeEntry,
     time_format: TimeFormat,
-) -> EntryInteraction {
-    let mut result = EntryInteraction {
-        double_clicked: false,
-    };
+) {
     let painter = ui.painter();
 
     // Accent color based on ticket type
@@ -1234,13 +1521,88 @@ fn render_schedule_entry(
             painter.galley(egui::pos2(x, line_y - dur_galley.size().y / 2.0), dur_galley, Color32::WHITE);
         }
     }
+}
 
-    // Interaction - double-click to edit
-    let response = ui.interact(rect, ui.id().with(&entry.worklog_id), egui::Sense::click());
+/// Render an entry as a ghost (semi-transparent) during drag
+/// display_text is either the new start time or the new duration depending on drag mode
+fn render_schedule_entry_ghost(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    entry: &crate::api::TimeEntry,
+    _time_format: TimeFormat,
+    display_text: &str,
+) {
+    let painter = ui.painter();
+    let alpha = 180; // Semi-transparent
 
-    if response.double_clicked() {
-        result.double_clicked = true;
+    // Accent color based on ticket type (same logic as paint version)
+    let accent_color = if entry.issue_key.starts_with("TIM-") {
+        let summary_upper = entry.issue_summary.to_uppercase();
+        if summary_upper.contains("MEETING") {
+            Color32::from_rgba_unmultiplied(0xe8, 0x28, 0x71, alpha)
+        } else if summary_upper.contains("SUPPORT") {
+            Color32::from_rgba_unmultiplied(0xec, 0x71, 0x1b, alpha)
+        } else if summary_upper.contains("ADMIN") {
+            Color32::from_rgba_unmultiplied(0xe5, 0xaa, 0x00, alpha)
+        } else {
+            Color32::from_rgba_unmultiplied(0x13, 0x98, 0xf4, alpha)
+        }
+    } else {
+        Color32::from_rgba_unmultiplied(0x13, 0x98, 0xf4, alpha)
+    };
+
+    // Draw block background
+    let block_bg = Color32::from_rgba_unmultiplied(0x1c, 0x1c, 0x1a, alpha);
+    let corner_radius = 4.0;
+
+    painter.rect(
+        rect,
+        corner_radius,
+        block_bg,
+        egui::Stroke::new(2.0, accent_color), // Thicker border for ghost
+    );
+
+    // Left accent stripe
+    let accent_width = 3.0;
+    let accent_rect = egui::Rect::from_min_size(
+        rect.min,
+        egui::vec2(accent_width, rect.height())
+    );
+    painter.rect(
+        accent_rect,
+        egui::Rounding {
+            nw: corner_radius,
+            sw: corner_radius,
+            ne: 0.0,
+            se: 0.0,
+        },
+        accent_color,
+        egui::Stroke::NONE,
+    );
+
+    // Text content - always show, centered vertically
+    let text_left = rect.min.x + accent_width + 4.0;
+    let text_color = Color32::from_rgba_unmultiplied(200, 200, 192, alpha);
+    let font_size = 13.0;
+    let key_font = egui::FontId::proportional(font_size);
+
+    // Center text vertically in the rect
+    let line_y = rect.center().y;
+    let mut x = text_left;
+
+    // Display text (time or duration) - highlighted in bright blue
+    let display_galley = painter.layout_no_wrap(
+        display_text.to_string(),
+        egui::FontId::new(font_size, super::theme::bold_family()),
+        Color32::from_rgba_unmultiplied(0x61, 0xAF, 0xEF, 255), // Bright blue
+    );
+    painter.galley(egui::pos2(x, line_y - display_galley.size().y / 2.0), display_galley.clone(), Color32::WHITE);
+    x += display_galley.size().x + 6.0;
+
+    // Issue key - only if it fits
+    let key_galley = painter.layout_no_wrap(entry.issue_key.clone(), key_font, text_color);
+    let available_width = rect.max.x - x - 4.0;
+    if key_galley.size().x < available_width {
+        painter.galley(egui::pos2(x, line_y - key_galley.size().y / 2.0), key_galley, Color32::WHITE);
     }
-
-    result
 }
