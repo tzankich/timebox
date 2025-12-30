@@ -1318,6 +1318,7 @@ impl JiraTimeApp {
             ViewMode::Schedule => {
                 // Schedule view - render timeline grid
                 let base_url = format!("https://{}", self.config.jira_domain);
+                let dialog_open = self.show_dialog || self.show_delete_confirm || self.show_reschedule_dialog;
                 let schedule_result = views::render_schedule_view(
                     ui,
                     &self.week_data,
@@ -1327,18 +1328,24 @@ impl JiraTimeApp {
                     self.config.schedule_start_hour,
                     self.config.schedule_end_hour,
                     self.config.snap_interval,
+                    dialog_open,
                 );
-                if let Some(entry) = schedule_result.edit_entry {
-                    self.open_edit_dialog(&entry);
-                }
-                if let Some(entry) = schedule_result.delete_entry {
-                    self.pending_delete = Some(entry);
-                    self.show_delete_confirm = true;
-                }
-                if let Some((date, start_time)) = schedule_result.add_at {
-                    self.selected_date = date;
-                    self.open_add_dialog();
-                    self.dialog_start_time = start_time;
+                // Only process schedule interactions when no dialog is open
+                // (prevents clicks in dialog from registering on entries behind it)
+                if !self.show_dialog && !self.show_delete_confirm && !self.show_reschedule_dialog {
+                    // Prioritize add_at (ghost click) over edit_entry to avoid conflict
+                    // when entry visual rects extend beyond their time bounds
+                    if let Some((date, start_time)) = schedule_result.add_at {
+                        self.selected_date = date;
+                        self.open_add_dialog();
+                        self.dialog_start_time = start_time;
+                    } else if let Some(entry) = schedule_result.edit_entry {
+                        self.open_edit_dialog(&entry);
+                    }
+                    if let Some(entry) = schedule_result.delete_entry {
+                        self.pending_delete = Some(entry);
+                        self.show_delete_confirm = true;
+                    }
                 }
 
                 // Handle drag move - optimistic update + async Jira call
@@ -1801,6 +1808,11 @@ impl eframe::App for JiraTimeApp {
                                     // Handle focus and text changes for autocomplete
                                     if issue_response.gained_focus() {
                                         self.show_suggestions = !self.issue_suggestions.is_empty();
+                                    }
+                                    if issue_response.lost_focus() {
+                                        // Delay hiding to allow click on suggestion to register
+                                        // We'll hide immediately for now and see if it helps
+                                        self.show_suggestions = false;
                                     }
 
                                     if issue_response.changed() {

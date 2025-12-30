@@ -835,6 +835,7 @@ pub fn render_schedule_view(
     schedule_start_hour: u8,
     schedule_end_hour: u8,
     snap_interval: crate::config::SnapInterval,
+    dialog_open: bool,
 ) -> ScheduleResult {
     let mut result = ScheduleResult::default();
     let show_weekends = should_show_weekends(week_data);
@@ -1168,8 +1169,8 @@ pub fn render_schedule_view(
                     });
                 }
 
-                // Show appropriate cursor when hovering over entry (not during drag)
-                if pointer_over_entry && !in_drag_mode {
+                // Show appropriate cursor when hovering over entry (not during drag, not when dialog open)
+                if pointer_over_entry && !in_drag_mode && !dialog_open {
                     if near_top_edge || near_bottom_edge {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                     } else {
@@ -1259,10 +1260,12 @@ pub fn render_schedule_view(
             }
             // Still holding - render drag preview if past threshold
             else if primary_down && is_long_press {
-                // Set appropriate cursor
-                match drag_mode {
-                    1 | 2 => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
-                    _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing),
+                // Set appropriate cursor (unless dialog is open)
+                if !dialog_open {
+                    match drag_mode {
+                        1 | 2 => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
+                        _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing),
+                    }
                 }
 
                 // Calculate ghost rect at new position
@@ -1356,10 +1359,12 @@ pub fn render_schedule_view(
                 }
             }
 
-            // Single-click on ghost creates entry (only if not over an existing entry)
-            if col_response.clicked() && !over_entry {
-                if let Some((_, ref time)) = result.ghost_position {
-                    if *day == result.ghost_position.as_ref().unwrap().0 {
+            // Single-click on ghost creates entry
+            // Note: we check ghost_position regardless of over_entry because entry visual rects
+            // can extend beyond their time bounds (min height), causing false positives
+            if col_response.clicked() {
+                if let Some((ghost_day, ref time)) = result.ghost_position {
+                    if *day == ghost_day {
                         result.ghost_clicked = true;
                         result.add_at = Some((*day, time.clone()));
                     }
