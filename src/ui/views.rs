@@ -834,6 +834,7 @@ pub fn render_schedule_view(
     clock_format: ClockFormat,
     schedule_start_hour: u8,
     schedule_end_hour: u8,
+    snap_interval: crate::config::SnapInterval,
 ) -> ScheduleResult {
     let mut result = ScheduleResult::default();
     let show_weekends = should_show_weekends(week_data);
@@ -1191,11 +1192,12 @@ pub fn render_schedule_view(
             // Get current pointer position
             let current_pos = ui.ctx().input(|i| i.pointer.latest_pos()).unwrap_or(egui::Pos2::ZERO);
 
-            // Calculate snapped time at current position (5-minute intervals)
+            // Calculate snapped time at current position
+            let snap = snap_interval.minutes();
             let relative_y = (current_pos.y - grid_rect.min.y).max(0.0);
             let hover_minutes = start_minutes + (relative_y / pixels_per_minute) as i32;
-            let snapped_minutes = ((hover_minutes + 2) / 5) * 5; // Round to nearest 5 min
-            let snapped_minutes = snapped_minutes.max(start_minutes).min(end_minutes - 5);
+            let snapped_minutes = ((hover_minutes + snap / 2) / snap) * snap; // Round to nearest snap interval
+            let snapped_minutes = snapped_minutes.max(start_minutes).min(end_minutes - snap);
 
             // Calculate new values based on drag mode
             let min_duration_minutes = 15; // Minimum 15-minute duration
@@ -1311,12 +1313,13 @@ pub fn render_schedule_view(
             if col_response.hovered() && !over_entry && !is_dragging_entry {
                 if let Some(pos) = ui.ctx().pointer_hover_pos() {
                     if pos.y >= grid_rect.min.y && pos.y <= grid_rect.max.y {
+                        let snap = snap_interval.minutes();
                         let relative_y = pos.y - grid_rect.min.y;
                         let hover_minutes = start_minutes + (relative_y / pixels_per_minute) as i32;
-                        let hour = hover_minutes / 60;
-                        let minute = hover_minutes % 60;
-                        // Snap to 15-minute intervals
-                        let snapped_minute = (minute / 15) * 15;
+                        // Snap to configured interval
+                        let snapped_minutes = ((hover_minutes + snap / 2) / snap) * snap;
+                        let hour = snapped_minutes / 60;
+                        let snapped_minute = snapped_minutes % 60;
                         let ghost_time = format!("{:02}:{:02}", hour, snapped_minute);
 
                         // Check if ghost would overlap existing entries (1 hour = 60 mins)
@@ -1366,12 +1369,13 @@ pub fn render_schedule_view(
             // Double-click on empty space creates entry (not over existing entry)
             if col_response.double_clicked() && !over_entry {
                 if let Some(pos) = col_response.interact_pointer_pos() {
+                    let snap = snap_interval.minutes();
                     let relative_y = pos.y - grid_rect.min.y;
                     let clicked_minutes = start_minutes + (relative_y / pixels_per_minute) as i32;
-                    let hour = clicked_minutes / 60;
-                    let minute = clicked_minutes % 60;
-                    // Snap to 15-minute intervals
-                    let snapped_minute = (minute / 15) * 15;
+                    // Snap to configured interval
+                    let snapped_minutes = ((clicked_minutes + snap / 2) / snap) * snap;
+                    let hour = snapped_minutes / 60;
+                    let snapped_minute = snapped_minutes % 60;
                     let start_time = format!("{:02}:{:02}", hour, snapped_minute);
                     result.add_at = Some((*day, start_time));
                 }

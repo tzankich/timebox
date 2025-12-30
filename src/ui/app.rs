@@ -1116,6 +1116,46 @@ impl JiraTimeApp {
                 }
             });
 
+            // Snap interval dropdown (only in Schedule view)
+            if self.config.view_mode == ViewMode::Schedule {
+                ui.add_space(12.0);
+                let snap_menu_id = ui.make_persistent_id("snap_interval_menu");
+
+                let snap_label = match self.config.snap_interval {
+                    crate::config::SnapInterval::OneMinute => "1m",
+                    crate::config::SnapInterval::FiveMinutes => "5m",
+                    crate::config::SnapInterval::FifteenMinutes => "15m",
+                };
+                let snap_text = format!("Snap to {} {}", snap_label, egui_phosphor::regular::CARET_DOWN);
+                let text_size = ui.fonts(|f| f.layout_no_wrap(snap_text.clone(), font_id.clone(), icon_color).size());
+                let (snap_rect, snap_response) = ui.allocate_exact_size(text_size + egui::vec2(6.0, 4.0), egui::Sense::click());
+                let snap_col = if snap_response.hovered() { hover_color } else { icon_color };
+                ui.painter().text(snap_rect.center(), egui::Align2::CENTER_CENTER, &snap_text, font_id.clone(), snap_col);
+
+                if snap_response.clicked() {
+                    ui.memory_mut(|mem| mem.toggle_popup(snap_menu_id));
+                }
+
+                egui::popup::popup_below_widget(ui, snap_menu_id, &snap_response, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    ui.set_min_width(60.0);
+                    ui.style_mut().spacing.button_padding = egui::vec2(12.0, 8.0);
+
+                    use crate::config::SnapInterval;
+                    for (interval, label) in [
+                        (SnapInterval::OneMinute, "1m"),
+                        (SnapInterval::FiveMinutes, "5m"),
+                        (SnapInterval::FifteenMinutes, "15m"),
+                    ] {
+                        if ui.add(egui::Button::new(
+                            RichText::new(label).size(14.0)
+                        ).frame(false)).clicked() {
+                            self.config.snap_interval = interval;
+                            let _ = self.config.save();
+                        }
+                    }
+                });
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Icon-only buttons for Settings and Reload - gray, white on hover
                 let text_color = Color32::from_rgb(150, 150, 150);
@@ -1286,6 +1326,7 @@ impl JiraTimeApp {
                     self.config.clock_format,
                     self.config.schedule_start_hour,
                     self.config.schedule_end_hour,
+                    self.config.snap_interval,
                 );
                 if let Some(entry) = schedule_result.edit_entry {
                     self.open_edit_dialog(&entry);

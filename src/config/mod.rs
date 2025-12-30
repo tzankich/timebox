@@ -32,6 +32,24 @@ pub enum ViewMode {
     Schedule,    // Multi-day schedule/timeline view
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SnapInterval {
+    OneMinute,   // 1 minute snapping
+    FiveMinutes, // 5 minute snapping
+    #[default]
+    FifteenMinutes, // 15 minute snapping (default)
+}
+
+impl SnapInterval {
+    pub fn minutes(&self) -> i32 {
+        match self {
+            SnapInterval::OneMinute => 1,
+            SnapInterval::FiveMinutes => 5,
+            SnapInterval::FifteenMinutes => 15,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub jira_domain: String,
@@ -56,6 +74,8 @@ pub struct Config {
     pub schedule_start_hour: u8,
     #[serde(default = "default_schedule_end_hour")]
     pub schedule_end_hour: u8,
+    #[serde(default)]
+    pub snap_interval: SnapInterval,
 }
 
 fn default_schedule_start_hour() -> u8 {
@@ -102,6 +122,7 @@ impl Default for Config {
             view_mode: ViewMode::List,
             schedule_start_hour: 5,
             schedule_end_hour: 20,
+            snap_interval: SnapInterval::FifteenMinutes,
         }
     }
 }
