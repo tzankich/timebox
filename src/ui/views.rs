@@ -1,4 +1,4 @@
-use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
+use chrono::{Datelike, Duration, Local, NaiveDate, Timelike, Weekday};
 use egui::{Color32, RichText, Ui};
 
 use crate::api::{TimeEntry, format_duration_with_format};
@@ -875,6 +875,18 @@ pub fn render_schedule_view(
         }
     }
 
+    // Expand range to include current time if today is visible
+    if days.contains(&today) {
+        let now = Local::now();
+        let now_hour = now.hour() as u8;
+        if now_hour < actual_start_hour {
+            actual_start_hour = now_hour;
+        }
+        if now_hour >= actual_end_hour {
+            actual_end_hour = (now_hour + 1).min(24);
+        }
+    }
+
     // Use actual range (expanded if needed)
     let schedule_start_hour = actual_start_hour;
     let schedule_end_hour = actual_end_hour;
@@ -1061,6 +1073,44 @@ pub fn render_schedule_view(
             }
         }
 
+        // "Now" line - shows current time across today's column
+        let now = Local::now();
+        let now_minutes = now.hour() as i32 * 60 + now.minute() as i32;
+        let schedule_start_minutes = schedule_start_hour as i32 * 60;
+        let schedule_end_minutes = schedule_end_hour as i32 * 60;
+
+        if now_minutes >= schedule_start_minutes && now_minutes <= schedule_end_minutes {
+            let now_y = grid_rect.min.y + (now_minutes - schedule_start_minutes) as f32 * (hour_height / 60.0);
+            let now_color = Color32::from_rgb(0xe5, 0x4d, 0x42);  // Red accent
+
+            // Find today's column and draw line only there
+            for (i, day) in days.iter().enumerate() {
+                if *day == today {
+                    let col_x = grid_rect.min.x + hour_label_width + i as f32 * day_width;
+
+                    // Small circle at the left edge
+                    painter.circle_filled(
+                        egui::pos2(col_x, now_y),
+                        3.0,
+                        now_color,
+                    );
+
+                    // Line across the column
+                    painter.line_segment(
+                        [
+                            egui::pos2(col_x, now_y),
+                            egui::pos2(col_x + day_width, now_y),
+                        ],
+                        egui::Stroke::new(1.5, now_color),
+                    );
+                    break;
+                }
+            }
+
+            // Request repaint in 60 seconds to update the line
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(60));
+        }
+
         // Render entries as blocks
         let pixels_per_minute = hour_height / 60.0;
         let start_minutes = schedule_start_hour as i32 * 60;
@@ -1156,7 +1206,8 @@ pub fn render_schedule_view(
                 let button_just_pressed = ui.ctx().input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
 
                 // Capture entry when click starts on it - store in memory with press time and drag mode
-                if pointer_over_entry && button_just_pressed && grabbed_state.is_none() {
+                // Skip if dialog is open to prevent clicks from going through
+                if pointer_over_entry && button_just_pressed && grabbed_state.is_none() && !dialog_open {
                     let drag_mode: u8 = if near_top_edge {
                         1 // resize-top
                     } else if near_bottom_edge {
@@ -1225,8 +1276,8 @@ pub fn render_schedule_view(
             let new_start_time = format!("{:02}:{:02}", new_hour, new_minute);
             let new_duration_seconds = ((new_end_minutes - new_start_minutes) * 60) as i64;
 
-            // Right-click or Esc cancels drag
-            if right_clicked || esc_pressed {
+            // Cancel drag if dialog opens, right-click, or Esc
+            if dialog_open || right_clicked || esc_pressed {
                 ui.ctx().memory_mut(|mem| {
                     mem.data.remove::<DragState>(drag_id);
                 });
@@ -1312,8 +1363,8 @@ pub fn render_schedule_view(
 
             let col_response = ui.interact(col_rect, ui.id().with(("day_col", day_idx)), egui::Sense::click_and_drag());
 
-            // Track hover position for ghost preview (only if not over an entry AND not dragging an existing entry)
-            if col_response.hovered() && !over_entry && !is_dragging_entry {
+            // Track hover position for ghost preview (only if not over an entry AND not dragging an existing entry AND no dialog open)
+            if col_response.hovered() && !over_entry && !is_dragging_entry && !dialog_open {
                 if let Some(pos) = ui.ctx().pointer_hover_pos() {
                     if pos.y >= grid_rect.min.y && pos.y <= grid_rect.max.y {
                         let snap = snap_interval.minutes();
@@ -1362,7 +1413,8 @@ pub fn render_schedule_view(
             // Single-click on ghost creates entry
             // Note: we check ghost_position regardless of over_entry because entry visual rects
             // can extend beyond their time bounds (min height), causing false positives
-            if col_response.clicked() {
+            // Skip if dialog is open to prevent clicks from going through
+            if col_response.clicked() && !dialog_open {
                 if let Some((ghost_day, ref time)) = result.ghost_position {
                     if *day == ghost_day {
                         result.ghost_clicked = true;
@@ -1372,7 +1424,8 @@ pub fn render_schedule_view(
             }
 
             // Double-click on empty space creates entry (not over existing entry)
-            if col_response.double_clicked() && !over_entry {
+            // Skip if dialog is open to prevent clicks from going through
+            if col_response.double_clicked() && !over_entry && !dialog_open {
                 if let Some(pos) = col_response.interact_pointer_pos() {
                     let snap = snap_interval.minutes();
                     let relative_y = pos.y - grid_rect.min.y;

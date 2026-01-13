@@ -13,6 +13,7 @@ A native desktop application for quickly logging time to Jira issues. Built with
 ## Features
 
 - **Two view modes**: List view for detailed entries, Schedule view for a weekly timeline
+- **Live timer**: Track time as you work with start/stop and seamless task switching
 - **Zoom with Ctrl+Mousewheel**: Scale the UI from 75% to 200% for comfortable viewing
 - View your week's time entries at a glance with day-by-day tabs
 - Quick-add buttons for common time buckets (Meetings, Support, Admin)
@@ -147,6 +148,41 @@ The Meeting, Support, and Admin buttons allow fast time entry to weekly bucket t
 - Click the **three-dot menu** on any entry for the same options
 
 When editing, you can modify the duration, category tags, start time, and description.
+
+### Timer
+
+The timer lets you track time as you work, rather than logging it after the fact. It appears as a collapsible bar at the bottom of the window.
+
+#### Getting started
+
+1. Click **Timer** at the bottom of the window to expand the timer bar
+2. Click the search field and find the issue you want to work on
+3. Click to select the issue - it will show the issue key and summary
+4. Click the green **play button** to start timing
+
+#### While the timer is running
+
+- The elapsed time displays in `HH:MM:SS` format, updating every second
+- A **"Switch to..."** search field lets you quickly change tasks
+- Click the red **stop button** when finished - the time is logged to Jira
+
+#### Switching tasks (quick-switch)
+
+To switch to a different task without gaps:
+
+1. While the timer is running, type in the "Switch to..." field
+2. Click the new issue from the suggestions
+3. The current timer stops (logging that time) and the new timer starts immediately
+
+This allows seamless all-day tracking without manually stopping and starting.
+
+#### Timer persistence
+
+The timer survives app restarts. If you close Timebox while a timer is running, it will resume when you reopen the app - the elapsed time continues from when you originally started.
+
+#### Collapsing the timer
+
+Click **Timer** to collapse the bar to a thin strip. If a timer is running, it will still show the issue key and elapsed time in the collapsed view.
 
 ### Zooming the interface
 

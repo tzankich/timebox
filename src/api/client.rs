@@ -277,20 +277,26 @@ impl JiraClient {
 
     /// Search for a weekly bucket ticket by keyword and week dates
     /// Searches for tickets containing the keyword (e.g., "MEETING") AND a date from the week
-    /// Uses Monday and Friday dates in multiple formats for robustness
+    /// Supports both Mon-Fri and Sun-Sat week formats
     pub async fn search_weekly_bucket(&self, keyword: &str, week_start: NaiveDate) -> Result<Option<Issue>> {
+        // Support both Mon-Fri (week_start is Monday) and Sun-Sat week formats
+        let sunday = week_start - chrono::Duration::days(1);  // Previous Sunday
         let monday = week_start;
         let friday = week_start + chrono::Duration::days(4);
+        let saturday = week_start + chrono::Duration::days(5);
 
-        // Generate date patterns for both Monday and Friday in multiple formats
-        // Examples for Dec 2, 2024: "12/2", "12/02", "Dec 2", "December 2"
+        // Generate date patterns for all boundary dates
+        let sun_patterns = generate_date_patterns(sunday);
         let mon_patterns = generate_date_patterns(monday);
         let fri_patterns = generate_date_patterns(friday);
+        let sat_patterns = generate_date_patterns(saturday);
 
         // Build JQL with OR conditions for all date patterns
-        let date_conditions: Vec<String> = mon_patterns
+        let date_conditions: Vec<String> = sun_patterns
             .iter()
+            .chain(mon_patterns.iter())
             .chain(fri_patterns.iter())
+            .chain(sat_patterns.iter())
             .map(|p| format!("summary ~ \"{}\"", p))
             .collect();
 

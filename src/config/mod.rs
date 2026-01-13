@@ -76,6 +76,8 @@ pub struct Config {
     pub schedule_end_hour: u8,
     #[serde(default)]
     pub snap_interval: SnapInterval,
+    #[serde(default)]
+    pub show_timer: bool,
 }
 
 fn default_schedule_start_hour() -> u8 {
@@ -123,6 +125,7 @@ impl Default for Config {
             schedule_start_hour: 5,
             schedule_end_hour: 20,
             snap_interval: SnapInterval::FifteenMinutes,
+            show_timer: false,
         }
     }
 }
@@ -179,5 +182,59 @@ impl Config {
             .unwrap_or(&self.jira_domain);
 
         format!("https://{}/rest/api/3", domain)
+    }
+}
+
+/// Persistent timer state - survives app restart
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TimerState {
+    /// Whether the timer is currently running
+    pub running: bool,
+    /// When the timer was started (ISO 8601 format for persistence)
+    pub start_time: Option<String>,
+    /// The issue key being timed
+    pub issue_key: String,
+    /// The issue summary for display
+    pub issue_summary: String,
+    /// The issue type for display
+    pub issue_type: String,
+}
+
+impl TimerState {
+    pub fn load() -> Result<Self> {
+        let path = Self::state_path()?;
+        if path.exists() {
+            let contents = fs::read_to_string(&path)
+                .context("Failed to read timer state file")?;
+            serde_json::from_str(&contents)
+                .context("Failed to parse timer state file")
+        } else {
+            Ok(TimerState::default())
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::state_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let contents = serde_json::to_string_pretty(self)?;
+        fs::write(&path, contents)?;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.running = false;
+        self.start_time = None;
+        self.issue_key.clear();
+        self.issue_summary.clear();
+        self.issue_type.clear();
+        self.save()
+    }
+
+    fn state_path() -> Result<PathBuf> {
+        let proj_dirs = ProjectDirs::from("com", "tzankich", "timebox")
+            .context("Could not determine config directory")?;
+        Ok(proj_dirs.config_dir().join("timer_state.json"))
     }
 }

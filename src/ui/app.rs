@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
 use crate::api::{JiraClient, TimeEntry, Issue, parse_duration, format_duration_with_format, extract_time, parse_date};
-use crate::config::{Config, TimeFormat, ClockFormat, ListViewMode, ViewMode};
+use crate::config::{Config, TimeFormat, ClockFormat, ListViewMode, ViewMode, TimerState};
 use crate::export;
 use crate::update::{self, UpdateInfo};
 use super::views::{self, week_start, WeekData};
@@ -91,6 +91,17 @@ pub struct JiraTimeApp {
     progress_start: std::time::Instant,
     progress_phase: ProgressPhase,
 
+    // Timer state (bottom dock)
+    timer_state: TimerState,
+    timer_search: String,
+    timer_suggestions: Vec<Issue>,
+    timer_show_suggestions: bool,
+    timer_last_search: String,
+    timer_last_search_time: Instant,
+    timer_searching: bool,
+    // Selected issue (before starting timer)
+    timer_selected_issue: Option<(String, String, String)>,  // (key, summary, issue_type)
+
     // Async communication
     runtime: tokio::runtime::Runtime,
     result_rx: Receiver<AsyncResult>,
@@ -114,6 +125,7 @@ enum AsyncResult {
     WorklogSaved(String, TimeEntry, bool),  // (message, entry, is_edit)
     WorklogDeleted(String, String),  // (message, worklog_id)
     IssueSuggestions(Vec<Issue>),
+    TimerIssueSuggestions(Vec<Issue>),  // Separate suggestions for timer search
     WeeklyBucketsLoaded(Vec<(String, String, String, String)>),  // (category, issue_key, issue_summary, issue_type)
     UpdateAvailable(UpdateInfo),
     UpdateApplied,
@@ -203,6 +215,14 @@ impl JiraTimeApp {
             progress: 0.0,
             progress_start: std::time::Instant::now(),
             progress_phase: ProgressPhase::Idle,
+            timer_state: TimerState::load().unwrap_or_default(),
+            timer_search: String::new(),
+            timer_suggestions: Vec::new(),
+            timer_show_suggestions: false,
+            timer_last_search: String::new(),
+            timer_last_search_time: Instant::now(),
+            timer_searching: false,
+            timer_selected_issue: None,
             runtime,
             result_rx,
             result_tx,
@@ -430,6 +450,11 @@ impl JiraTimeApp {
                     self.issue_suggestions = issues;
                     self.searching_issues = false;
                     self.show_suggestions = !self.issue_suggestions.is_empty();
+                }
+                AsyncResult::TimerIssueSuggestions(issues) => {
+                    self.timer_suggestions = issues;
+                    self.timer_searching = false;
+                    self.timer_show_suggestions = !self.timer_suggestions.is_empty();
                 }
                 AsyncResult::WeeklyBucketsLoaded(buckets) => {
                     self.weekly_buckets.clear();
@@ -691,6 +716,154 @@ impl JiraTimeApp {
                 }
             }
         });
+    }
+
+    fn search_timer_issues(&mut self, query: &str) {
+        if self.timer_searching {
+            return;
+        }
+
+        self.timer_searching = true;
+        self.timer_last_search = query.to_string();
+
+        let config = self.config.clone();
+        let tx = self.result_tx.clone();
+        let query = query.to_string();
+
+        self.runtime.spawn(async move {
+            let result = async {
+                let client = JiraClient::new(&config)?;
+                if query.is_empty() {
+                    client.get_recent_issues().await
+                } else {
+                    client.search_issues_by_text(&query).await
+                }
+            }.await;
+
+            match result {
+                Ok(issues) => {
+                    let _ = tx.send(AsyncResult::TimerIssueSuggestions(issues));
+                }
+                Err(_) => {
+                    let _ = tx.send(AsyncResult::TimerIssueSuggestions(Vec::new()));
+                }
+            }
+        });
+    }
+
+    fn timer_start(&mut self, issue_key: String, issue_summary: String, issue_type: String) {
+        let now = Local::now();
+        self.timer_state.running = true;
+        self.timer_state.start_time = Some(now.to_rfc3339());
+        self.timer_state.issue_key = issue_key;
+        self.timer_state.issue_summary = issue_summary;
+        self.timer_state.issue_type = issue_type;
+        self.timer_search.clear();
+        self.timer_suggestions.clear();
+        self.timer_show_suggestions = false;
+        let _ = self.timer_state.save();
+    }
+
+    fn timer_stop(&mut self) {
+        if !self.timer_state.running {
+            return;
+        }
+
+        // Parse start time and calculate duration
+        let start_time_str = match &self.timer_state.start_time {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        let start_dt = match chrono::DateTime::parse_from_rfc3339(&start_time_str) {
+            Ok(dt) => dt.with_timezone(&Local),
+            Err(_) => return,
+        };
+
+        let now = Local::now();
+        let duration = now.signed_duration_since(start_dt);
+        let seconds = duration.num_seconds().max(0);
+
+        // Round to nearest minute (Jira doesn't support seconds)
+        let minutes = (seconds + 30) / 60;
+        let final_seconds = minutes.max(1) * 60;  // Minimum 1 minute
+
+        // Extract start time as HH:MM
+        let start_time_hhmm = start_dt.format("%H:%M").to_string();
+        let date = start_dt.date_naive();
+
+        // Create worklog via async
+        let config = self.config.clone();
+        let tx = self.result_tx.clone();
+        let issue_key = self.timer_state.issue_key.clone();
+        let issue_summary = self.timer_state.issue_summary.clone();
+        let issue_type = self.timer_state.issue_type.clone();
+
+        // Clear timer state
+        let _ = self.timer_state.clear();
+
+        // Show loading
+        self.loading = true;
+        self.progress = 0.0;
+        self.progress_phase = ProgressPhase::FastStart;
+        self.progress_start = std::time::Instant::now();
+
+        self.runtime.spawn(async move {
+            let result: Result<(String, TimeEntry, bool), anyhow::Error> = async {
+                let client = JiraClient::new(&config)?;
+                let worklog = client.log_time(
+                    &issue_key,
+                    final_seconds,
+                    date,
+                    "",  // No description for timer entries
+                    Some(&start_time_hhmm),
+                ).await?;
+
+                let start_time = extract_time(&worklog.started);
+                let entry = TimeEntry {
+                    worklog_id: worklog.id,
+                    issue_key: issue_key.clone(),
+                    issue_summary,
+                    issue_type,
+                    seconds: final_seconds,
+                    description: String::new(),
+                    date,
+                    start_time,
+                };
+                Ok((format!("Logged {} to {}", format_duration_with_format(final_seconds, crate::config::TimeFormat::HoursMinutes), issue_key), entry, false))
+            }.await;
+
+            match result {
+                Ok((msg, entry, is_edit)) => {
+                    let _ = tx.send(AsyncResult::WorklogSaved(msg, entry, is_edit));
+                }
+                Err(e) => {
+                    let err_str = e.to_string().to_lowercase();
+                    if err_str.contains("connection") || err_str.contains("network")
+                       || err_str.contains("error sending request") || err_str.contains("timeout") {
+                        let _ = tx.send(AsyncResult::Offline);
+                    } else {
+                        let _ = tx.send(AsyncResult::Error(format!("Timer log failed: {}", e)));
+                    }
+                }
+            }
+        });
+    }
+
+    fn timer_elapsed_seconds(&self) -> i64 {
+        if !self.timer_state.running {
+            return 0;
+        }
+        let start_time_str = match &self.timer_state.start_time {
+            Some(s) => s,
+            None => return 0,
+        };
+        let start_dt = match chrono::DateTime::parse_from_rfc3339(start_time_str) {
+            Ok(dt) => dt.with_timezone(&Local),
+            Err(_) => return 0,
+        };
+        let now = Local::now();
+        now.signed_duration_since(start_dt).num_seconds().max(0)
     }
 
     fn open_add_dialog(&mut self) {
@@ -1615,6 +1788,325 @@ impl JiraTimeApp {
             }
         });
     }
+
+    fn render_timer_bar(&mut self, ctx: &egui::Context) {
+        let bar_height = if self.config.show_timer { 48.0 } else { 28.0 };
+        let bg_color = Color32::from_rgb(0x1a, 0x1a, 0x18);
+        let border_color = Color32::from_rgb(0x2a, 0x2a, 0x28);
+        let text_color = Color32::from_rgb(0xb0, 0xb0, 0xa8);
+        let accent_color = Color32::from_rgb(0x13, 0x98, 0xf4);
+
+        egui::TopBottomPanel::bottom("timer_panel")
+            .exact_height(bar_height)
+            .frame(egui::Frame::none()
+                .fill(bg_color)
+                .stroke(egui::Stroke::new(1.0, border_color))
+                .inner_margin(egui::Margin::symmetric(12.0, 6.0)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // Toggle button (always visible)
+                    let toggle_icon = if self.config.show_timer {
+                        egui_phosphor::regular::CARET_DOWN
+                    } else {
+                        egui_phosphor::regular::CARET_UP
+                    };
+                    let toggle_label = if self.config.show_timer { "Timer" } else { "Timer" };
+                    let toggle_text = format!("{} {}", toggle_icon, toggle_label);
+
+                    let toggle_response = ui.add(egui::Label::new(
+                        RichText::new(&toggle_text).size(14.0).color(text_color)
+                    ).sense(egui::Sense::click()));
+
+                    if toggle_response.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if toggle_response.clicked() {
+                        self.config.show_timer = !self.config.show_timer;
+                        let _ = self.config.save();
+                    }
+
+                    if !self.config.show_timer {
+                        // Collapsed: show running timer info if active
+                        if self.timer_state.running {
+                            ui.add_space(16.0);
+                            ui.label(RichText::new(&self.timer_state.issue_key).size(14.0).color(accent_color));
+
+                            let elapsed = self.timer_elapsed_seconds();
+                            let hours = elapsed / 3600;
+                            let minutes = (elapsed % 3600) / 60;
+                            let secs = elapsed % 60;
+                            let time_str = format!("{:02}:{:02}:{:02}", hours, minutes, secs);
+                            ui.label(RichText::new(&time_str).size(14.0).color(Color32::WHITE).family(crate::ui::theme::bold_family()));
+
+                            // Request repaint to update timer display
+                            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                        }
+                        return;
+                    }
+
+                    ui.add_space(16.0);
+
+                    // Expanded view
+                    if self.timer_state.running {
+                        // Running timer: show current issue and search for next
+                        ui.label(RichText::new(&self.timer_state.issue_key).size(14.0).color(accent_color));
+                        ui.add_space(8.0);
+
+                        // Truncate summary if too long
+                        let summary = if self.timer_state.issue_summary.len() > 40 {
+                            format!("{}...", &self.timer_state.issue_summary[..37])
+                        } else {
+                            self.timer_state.issue_summary.clone()
+                        };
+                        ui.label(RichText::new(&summary).size(14.0).color(text_color));
+
+                        ui.add_space(16.0);
+
+                        // Search field for switching tasks (quick-switch)
+                        let search_width = 150.0;
+                        let search_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.timer_search)
+                                .hint_text("Switch to...")
+                                .desired_width(search_width)
+                        );
+
+                        // Handle search with debounce
+                        if search_response.changed() {
+                            let debounce_ms = 300;
+                            if self.timer_search != self.timer_last_search
+                                && self.timer_last_search_time.elapsed().as_millis() > debounce_ms
+                            {
+                                self.timer_last_search_time = Instant::now();
+                                if self.timer_search.len() >= 2 || self.timer_search.is_empty() {
+                                    self.search_timer_issues(&self.timer_search.clone());
+                                }
+                            }
+                        }
+
+                        // Show suggestions dropdown for quick-switch
+                        if self.timer_show_suggestions && !self.timer_suggestions.is_empty() {
+                            let popup_id = ui.make_persistent_id("timer_switch_popup");
+                            let popup_pos = search_response.rect.left_bottom();
+
+                            egui::Area::new(popup_id)
+                                .fixed_pos(popup_pos)
+                                .order(egui::Order::Foreground)
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style())
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(search_width);
+                                            ui.set_max_height(200.0);
+
+                                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                                let mut selected_issue: Option<(String, String, String)> = None;
+
+                                                for issue in &self.timer_suggestions {
+                                                    let issue_text = format!("{} - {}", issue.key, issue.fields.summary);
+                                                    let response = ui.add(
+                                                        egui::Label::new(RichText::new(&issue_text).size(13.0))
+                                                            .wrap_mode(egui::TextWrapMode::Truncate)
+                                                            .sense(egui::Sense::click())
+                                                    );
+
+                                                    if response.hovered() {
+                                                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                    }
+
+                                                    if response.clicked() {
+                                                        let issue_type_name = issue.fields.issue_type
+                                                            .as_ref()
+                                                            .map(|it| it.name.clone())
+                                                            .unwrap_or_else(|| "Task".to_string());
+                                                        selected_issue = Some((
+                                                            issue.key.clone(),
+                                                            issue.fields.summary.clone(),
+                                                            issue_type_name,
+                                                        ));
+                                                    }
+                                                }
+
+                                                // Quick-switch: stop current, start new
+                                                if let Some((key, summary, issue_type)) = selected_issue {
+                                                    self.timer_stop();
+                                                    self.timer_start(key, summary, issue_type);
+                                                    self.timer_search.clear();
+                                                    self.timer_show_suggestions = false;
+                                                }
+                                            });
+                                        });
+                                });
+
+                            if search_response.lost_focus() && !ctx.input(|i| i.pointer.any_down()) {
+                                self.timer_show_suggestions = false;
+                            }
+                        }
+
+                        if search_response.gained_focus() && self.timer_search.is_empty() {
+                            self.search_timer_issues("");
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Stop button
+                            let stop_btn = ui.add(egui::Button::new(
+                                RichText::new(format!("{}", egui_phosphor::fill::STOP)).size(20.0).color(Color32::WHITE)
+                            ).fill(Color32::from_rgb(0xe5, 0x4d, 0x42)).rounding(4.0).min_size(egui::vec2(36.0, 28.0)));
+
+                            if stop_btn.clicked() {
+                                self.timer_stop();
+                            }
+
+                            ui.add_space(12.0);
+
+                            // Elapsed time display
+                            let elapsed = self.timer_elapsed_seconds();
+                            let hours = elapsed / 3600;
+                            let minutes = (elapsed % 3600) / 60;
+                            let secs = elapsed % 60;
+                            let time_str = format!("{:02}:{:02}:{:02}", hours, minutes, secs);
+                            ui.label(RichText::new(&time_str).size(18.0).color(Color32::WHITE).family(crate::ui::theme::bold_family()));
+
+                            // Request repaint to update timer display
+                            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                        });
+                    } else if let Some((ref key, ref summary, ref _issue_type)) = self.timer_selected_issue {
+                        // Issue selected but not started: show selected issue with Start button
+                        ui.label(RichText::new(key).size(14.0).color(accent_color));
+                        ui.add_space(8.0);
+
+                        // Truncate summary if too long
+                        let display_summary = if summary.len() > 40 {
+                            format!("{}...", &summary[..37])
+                        } else {
+                            summary.clone()
+                        };
+                        ui.label(RichText::new(&display_summary).size(14.0).color(text_color));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Start button
+                            let start_btn = ui.add(egui::Button::new(
+                                RichText::new(format!("{}", egui_phosphor::fill::PLAY)).size(20.0).color(Color32::WHITE)
+                            ).fill(Color32::from_rgb(0x4c, 0xaf, 0x50)).rounding(4.0).min_size(egui::vec2(36.0, 28.0)));
+
+                            if start_btn.clicked() {
+                                if let Some((key, summary, issue_type)) = self.timer_selected_issue.take() {
+                                    self.timer_start(key, summary, issue_type);
+                                }
+                            }
+
+                            ui.add_space(8.0);
+
+                            // Clear selection button (X)
+                            let clear_btn = ui.add(egui::Label::new(
+                                RichText::new(egui_phosphor::regular::X).size(16.0).color(text_color)
+                            ).sense(egui::Sense::click()));
+
+                            if clear_btn.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if clear_btn.clicked() {
+                                self.timer_selected_issue = None;
+                            }
+
+                            ui.add_space(12.0);
+
+                            // Placeholder time
+                            ui.label(RichText::new("00:00:00").size(18.0).color(Color32::from_rgb(0x60, 0x60, 0x58)).family(crate::ui::theme::bold_family()));
+                        });
+                    } else {
+                        // No issue selected: show search field
+                        let search_width = 250.0;
+
+                        // Issue search field
+                        let search_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.timer_search)
+                                .hint_text("Search issue...")
+                                .desired_width(search_width)
+                        );
+
+                        // Handle search with debounce
+                        if search_response.changed() {
+                            let debounce_ms = 300;
+                            if self.timer_search != self.timer_last_search
+                                && self.timer_last_search_time.elapsed().as_millis() > debounce_ms
+                            {
+                                self.timer_last_search_time = Instant::now();
+                                if self.timer_search.len() >= 2 || self.timer_search.is_empty() {
+                                    self.search_timer_issues(&self.timer_search.clone());
+                                }
+                            }
+                        }
+
+                        // Show suggestions dropdown
+                        if self.timer_show_suggestions && !self.timer_suggestions.is_empty() {
+                            let popup_id = ui.make_persistent_id("timer_suggestions_popup");
+                            let popup_pos = search_response.rect.left_bottom();
+
+                            egui::Area::new(popup_id)
+                                .fixed_pos(popup_pos)
+                                .order(egui::Order::Foreground)
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style())
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(search_width);
+                                            ui.set_max_height(200.0);
+
+                                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                                let mut selected_issue: Option<(String, String, String)> = None;
+
+                                                for issue in &self.timer_suggestions {
+                                                    let issue_text = format!("{} - {}", issue.key, issue.fields.summary);
+                                                    let response = ui.add(
+                                                        egui::Label::new(RichText::new(&issue_text).size(13.0))
+                                                            .wrap_mode(egui::TextWrapMode::Truncate)
+                                                            .sense(egui::Sense::click())
+                                                    );
+
+                                                    if response.hovered() {
+                                                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                    }
+
+                                                    if response.clicked() {
+                                                        let issue_type_name = issue.fields.issue_type
+                                                            .as_ref()
+                                                            .map(|it| it.name.clone())
+                                                            .unwrap_or_else(|| "Task".to_string());
+                                                        selected_issue = Some((
+                                                            issue.key.clone(),
+                                                            issue.fields.summary.clone(),
+                                                            issue_type_name,
+                                                        ));
+                                                    }
+                                                }
+
+                                                // Select issue (don't start yet)
+                                                if let Some(issue) = selected_issue {
+                                                    self.timer_selected_issue = Some(issue);
+                                                    self.timer_search.clear();
+                                                    self.timer_show_suggestions = false;
+                                                }
+                                            });
+                                        });
+                                });
+
+                            // Close suggestions when clicking elsewhere
+                            if search_response.lost_focus() && !ctx.input(|i| i.pointer.any_down()) {
+                                self.timer_show_suggestions = false;
+                            }
+                        }
+
+                        // Focus field triggers search for recent issues
+                        if search_response.gained_focus() && self.timer_search.is_empty() {
+                            self.search_timer_issues("");
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Placeholder for elapsed time (shows 00:00:00 when not running)
+                            ui.label(RichText::new("00:00:00").size(18.0).color(Color32::from_rgb(0x60, 0x60, 0x58)).family(crate::ui::theme::bold_family()));
+                        });
+                    }
+                });
+            });
+    }
 }
 
 impl eframe::App for JiraTimeApp {
@@ -1808,11 +2300,6 @@ impl eframe::App for JiraTimeApp {
                                     // Handle focus and text changes for autocomplete
                                     if issue_response.gained_focus() {
                                         self.show_suggestions = !self.issue_suggestions.is_empty();
-                                    }
-                                    if issue_response.lost_focus() {
-                                        // Delay hiding to allow click on suggestion to register
-                                        // We'll hide immediately for now and see if it helps
-                                        self.show_suggestions = false;
                                     }
 
                                     if issue_response.changed() {
@@ -2358,6 +2845,11 @@ impl eframe::App for JiraTimeApp {
                     );
                     painter.rect_filled(fill_rect, 3.0, Color32::from_rgb(0x13, 0x98, 0xf4));
                 });
+        }
+
+        // Timer bar at bottom (only in Main state and when configured)
+        if self.state == AppState::Main && self.config.is_configured() {
+            self.render_timer_bar(ctx);
         }
 
         egui::CentralPanel::default().frame(
