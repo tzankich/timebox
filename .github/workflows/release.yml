@@ -18,7 +18,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: timebox.exe
             asset_name: timebox-x86_64-pc-windows-msvc.exe
-            upx: true
+            upx: false  # Disabled - triggers Windows Defender false positives
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: timebox
