@@ -286,28 +286,26 @@ impl JiraClient {
         let saturday = week_start + chrono::Duration::days(5);
 
         // Generate date patterns for all boundary dates
-        let sun_patterns = generate_date_patterns(sunday);
-        let mon_patterns = generate_date_patterns(monday);
-        let fri_patterns = generate_date_patterns(friday);
-        let sat_patterns = generate_date_patterns(saturday);
-
-        // Build JQL with OR conditions for all date patterns
-        let date_conditions: Vec<String> = sun_patterns
+        let boundary_dates = [sunday, monday, friday, saturday];
+        let all_patterns: Vec<String> = boundary_dates
             .iter()
-            .chain(mon_patterns.iter())
-            .chain(fri_patterns.iter())
-            .chain(sat_patterns.iter())
-            .map(|p| format!("summary ~ \"{}\"", p))
+            .flat_map(|d| generate_date_patterns(*d))
             .collect();
 
+        // Search by keyword only, then filter by date in code
+        // This avoids JQL text search issues with hyphens and special characters
         let jql = format!(
-            "summary ~ \"{}\" AND ({}) ORDER BY key DESC",
-            keyword,
-            date_conditions.join(" OR ")
+            "summary ~ \"{}\" ORDER BY key DESC",
+            keyword
         );
 
-        let response = self.search_issues(&jql, 1).await?;
-        Ok(response.issues.into_iter().next())
+        let response = self.search_issues(&jql, 10).await?;
+
+        // Find the first issue whose summary contains any of our date patterns
+        Ok(response.issues.into_iter().find(|issue| {
+            let summary = &issue.fields.summary;
+            all_patterns.iter().any(|pattern| summary.contains(pattern))
+        }))
     }
 
     /// Search for all weekly bucket tickets for a given week
